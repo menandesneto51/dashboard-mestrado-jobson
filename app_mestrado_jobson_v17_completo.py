@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Dashboard Executivo & Estatístico - Stewardship Antimicrobiano
-Mestrado Fiocruz - Versão expandida V19
+Mestrado Fiocruz - Versão expandida V20
 
 Esta versão mantém a planilha/formulário já existentes e cria novas análises
 apenas a partir dos campos já disponíveis na aba PRESCRIÇÕES.
@@ -10,7 +10,7 @@ Como usar:
 1) Coloque este arquivo .py na mesma pasta da planilha:
    Sistema de Monitoramento - Mestrado Jobson (V14.0).xlsx
 2) Execute:
-   python -m streamlit run app_mestrado_jobson_v19_score.py
+   python -m streamlit run app_mestrado_jobson_v20_pvalues.py
 
 Dependências principais:
 pip install streamlit pandas numpy scipy statsmodels plotly openpyxl
@@ -44,9 +44,9 @@ px.defaults.color_continuous_scale = "Viridis"
 
 st.title("📊 Dashboard Executivo & Estatístico - Stewardship Antimicrobiano")
 st.caption(
-    "V19 expandida: mantém a planilha/formulário existentes e adiciona Tabela 1, "
+    "V20 expandida: mantém a planilha/formulário existentes, preserva a V19 e adiciona exibição sistemática de p-valores, decisão estatística e interpretação em todas as análises inferenciais; inclui Tabela 1, "
     "auditoria de qualidade, AWaRe aproximado, ASI, profilaxia cirúrgica, sobreposição potencial, "
-    "ranking de antimicrobianos, bootstrap, simulação epidemiológica e Score de Risco de Stewardship (SRS)."
+    "ranking de antimicrobianos, bootstrap, simulação epidemiológica e Score de Risco de Stewardship (SRS) e painel consolidado de p-valores."
 )
 st.markdown("---")
 
@@ -919,6 +919,120 @@ def calculate_diagnostic_metrics(sensitivity, specificity, prevalence):
     npv = (specificity * (1 - prevalence)) / ((specificity * (1 - prevalence)) + (1 - sensitivity) * prevalence + eps)
     return ppv, npv
 
+
+
+def tabela_resultado_inferencia(nome, teste, estatistica=np.nan, p=np.nan, efeito=np.nan, detalhes=""):
+    """Padroniza uma linha de resultado inferencial para exibir p-valor e interpretação."""
+    return {
+        "Análise": nome,
+        "Teste": teste,
+        "Estatística": estatistica,
+        "p-valor": p,
+        "p formatado": formatar_p(p),
+        "Decisão": classe_decisao_p(p),
+        "Interpretação": interpretar_p(p),
+        "Tamanho de efeito / parâmetro": efeito,
+        "Detalhes": detalhes,
+    }
+
+
+def exibir_resultado_categorico(nome, tabela, detalhes_extra=""):
+    """Executa e exibe teste categórico com p-valor e interpretação padronizados."""
+    if tabela is None or tabela.empty or tabela.to_numpy().sum() == 0:
+        st.warning(f"{nome}: dados insuficientes para teste inferencial.")
+        return None
+    teste, p, efeito, menor_esp, chi2 = teste_categorico(tabela)
+    detalhes = []
+    if pd.notna(efeito):
+        if teste == "Fisher exato":
+            detalhes.append(f"OR={efeito:.2f}".replace(".", ","))
+        else:
+            detalhes.append(f"V de Cramer={efeito:.2f}".replace(".", ","))
+    if pd.notna(menor_esp):
+        detalhes.append(f"menor esperado={menor_esp:.2f}".replace(".", ","))
+    if detalhes_extra:
+        detalhes.append(detalhes_extra)
+    mostrar_resultado_teste(nome=f"{teste}: {nome}", estatistica=chi2, p=p, detalhes="; ".join(detalhes))
+    return tabela_resultado_inferencia(nome, teste, estatistica=chi2, p=p, efeito=efeito, detalhes="; ".join(detalhes))
+
+
+def exibir_sem_pvalor(nome, motivo):
+    """Exibe aviso metodológico para análises descritivas/simulatórias sem hipótese estatística."""
+    st.caption(f"**{nome}:** não há p-valor aplicável. {motivo}")
+
+
+def montar_painel_inferencial(df_presc, df_int, df_overlap):
+    """Monta painel consolidado com p-valores de todas as inferências padronizadas do dashboard."""
+    linhas = []
+
+    def add_cat(nome, tabela):
+        try:
+            if tabela is not None and not tabela.empty and tabela.to_numpy().sum() > 0:
+                teste, p, efeito, menor_esp, chi2 = teste_categorico(tabela)
+                detalhes = []
+                if pd.notna(menor_esp):
+                    detalhes.append(f"menor esperado={menor_esp:.2f}".replace(".", ","))
+                linhas.append(tabela_resultado_inferencia(nome, teste, estatistica=chi2, p=p, efeito=efeito, detalhes="; ".join(detalhes)))
+        except Exception as e:
+            linhas.append(tabela_resultado_inferencia(nome, "Erro no teste", detalhes=str(e)))
+
+    def add_kw(nome, df, grupo, valor):
+        try:
+            res = kruskal_por_grupo(df, grupo, valor)
+            if res is not None:
+                h, p, dados = res
+                linhas.append(tabela_resultado_inferencia(nome, "Kruskal-Wallis", estatistica=h, p=p, detalhes=f"grupos={len(dados)}"))
+        except Exception as e:
+            linhas.append(tabela_resultado_inferencia(nome, "Erro no teste", detalhes=str(e)))
+
+    def add_spear(nome, df, x, y):
+        try:
+            base = df[[x, y]].dropna()
+            if len(base) >= 5 and base[x].nunique() > 1 and base[y].nunique() > 1:
+                rho, p = stats.spearmanr(base[x], base[y])
+                linhas.append(tabela_resultado_inferencia(nome, "Spearman", estatistica=rho, p=p, efeito=rho, detalhes=interpretar_rho(rho)))
+        except Exception as e:
+            linhas.append(tabela_resultado_inferencia(nome, "Erro no teste", detalhes=str(e)))
+
+    # Contínuas por setor / grupos
+    add_kw("DOT por setor", df_presc, "Setor_Padronizado", "DOT_Exato")
+    add_kw("ASI por setor", df_presc.dropna(subset=["ASI"]), "Setor_Padronizado", "ASI")
+    add_kw("Custo por setor", df_presc, "Setor_Padronizado", "CUSTO_TOTAL_R$")
+    add_kw("SRS por setor", df_presc, "Setor_Padronizado", "SRS_Prescricao")
+    add_kw("Custo total por internação e setor", df_int, "setor_principal", "custo_total")
+    add_kw("SRS máximo por internação e setor", df_int, "setor_principal", "srs_max")
+    add_kw("DOT total por internação e setor", df_int, "setor_principal", "dot_total")
+
+    # Categóricas
+    add_cat("Classe farmacológica por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["CLASSE"]))
+    add_cat("Status DDD por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["Status_DDD"]))
+    add_cat("AWaRe por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["AWaRe"]))
+    add_cat("Erro de administração por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["Erro_Administracao"]))
+    add_cat("Erro de administração por motivo", pd.crosstab(df_presc["Motivo"], df_presc["Erro_Administracao"]))
+    add_cat("Status DDD x erro de administração", pd.crosstab(df_presc["Status_DDD"], df_presc["Erro_Administracao"]))
+    add_cat("AWaRe x erro de administração", pd.crosstab(df_presc["AWaRe"], df_presc["Erro_Administracao"]))
+    add_cat("Profilaxia >24h por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["Profilaxia_Maior_24h"]))
+    add_cat("SRS alto/muito alto por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["SRS_Prescricao"].ge(50).astype(int)))
+    add_cat("SRS muito alto por setor", pd.crosstab(df_presc["Setor_Padronizado"], df_presc["SRS_Prescricao"].ge(75).astype(int)))
+    add_cat("Desfecho final por setor", pd.crosstab(df_int["setor_principal"], df_int["desfecho_final"]))
+
+    if df_overlap is not None and not df_overlap.empty:
+        overlap_ids = set(df_overlap["ID_Internacao"].dropna().astype(str))
+        tmp = df_int.copy()
+        tmp["sobreposicao_potencial"] = tmp["ID_Internacao"].astype(str).isin(overlap_ids).astype(int)
+        add_cat("Sobreposição potencial por setor", pd.crosstab(tmp["setor_principal"], tmp["sobreposicao_potencial"]))
+
+    # Correlações centrais
+    for x, y in [("DOT_Exato", "CUSTO_TOTAL_R$"), ("DOT_Exato", "SRS_Prescricao"), ("CUSTO_TOTAL_R$", "SRS_Prescricao"), ("ASI", "SRS_Prescricao")]:
+        add_spear(f"Correlação {x} x {y}", df_presc, x, y)
+    for x, y in [("dot_total", "custo_total"), ("srs_max", "custo_total"), ("asi_total", "custo_total")]:
+        add_spear(f"Correlação {x} x {y}", df_int, x, y)
+
+    out = pd.DataFrame(linhas)
+    if not out.empty:
+        out = out.sort_values(["p-valor", "Análise"], na_position="last").reset_index(drop=True)
+    return out
+
 # ============================================================
 # 5. LEITURA DOS DADOS
 # ============================================================
@@ -968,7 +1082,7 @@ st.caption(
 # 7. ABAS DO DASHBOARD
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "👁️ 1. Visão Geral",
     "📈 2. Padrões Clínicos",
     "🏥 3. Desfechos e Risco",
@@ -980,6 +1094,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "🔮 9. Modelagem & Bootstrap",
     "🧭 10. SRS & Relatório",
     "🧪 11. Sensibilidade",
+    "📊 12. P-values",
 ])
 
 # ------------------------------------------------------------
@@ -1009,6 +1124,7 @@ with tab1:
         st.plotly_chart(px.pie(df_filtrado, names="Motivo", title="Motivo da prescrição", hole=0.45), use_container_width=True)
     with col4:
         st.plotly_chart(px.pie(df_filtrado, names="AWaRe", title="Classificação AWaRe aproximada", hole=0.45), use_container_width=True)
+    exibir_sem_pvalor("Visão geral", "Esta aba apresenta descrições e distribuições; os testes inferenciais correspondentes aparecem nas abas específicas e no painel consolidado de p-valores.")
 
 # ------------------------------------------------------------
 # ABA 2
@@ -1041,6 +1157,7 @@ with tab2:
         tabela_ddd_setor = pd.crosstab(df_filtrado["Setor_Padronizado"], df_filtrado["Status_DDD"])
         st.write("Status DDD por setor")
         st.dataframe(tabela_ddd_setor, use_container_width=True)
+        exibir_resultado_categorico("Status DDD por setor", tabela_ddd_setor)
 
 # ------------------------------------------------------------
 # ABA 3
@@ -1107,6 +1224,14 @@ with tab4:
         st.plotly_chart(px.scatter(df_internacao_filtrado, x="dot_total", y="custo_total", color="setor_principal", size="n_atb", title="Custo total x DOT total por internação"), use_container_width=True)
     corr_custo = correlacoes_spearman(df_internacao_filtrado, ["dot_total", "custo_total", "n_atb", "n_prescricoes", "asi_total"])
     st.dataframe(corr_custo.round(4), use_container_width=True)
+    for _, linha in corr_custo.iterrows():
+        if pd.notna(linha.get("p-valor", np.nan)):
+            mostrar_resultado_teste(
+                f"Spearman: {linha['Variável 1']} x {linha['Variável 2']}",
+                estatistica=linha.get("rho Spearman", np.nan),
+                p=linha.get("p-valor", np.nan),
+                detalhes=linha.get("Interpretação da força", ""),
+            )
 
 # ------------------------------------------------------------
 # ABA 5
@@ -1171,8 +1296,11 @@ with tab6:
     with col1:
         aware_tab = pd.crosstab(df_filtrado["Setor_Padronizado"], df_filtrado["AWaRe"], normalize="index") * 100
         st.plotly_chart(px.bar(aware_tab.reset_index(), x="Setor_Padronizado", y=aware_tab.columns, barmode="stack", title="AWaRe por setor (%)"), use_container_width=True)
+        aware_tab_abs = pd.crosstab(df_filtrado["Setor_Padronizado"], df_filtrado["AWaRe"])
+        exibir_resultado_categorico("AWaRe por setor", aware_tab_abs)
     with col2:
         st.plotly_chart(px.box(df_filtrado.dropna(subset=["ASI"]), x="Setor_Padronizado", y="ASI", points="all", title="ASI por setor"), use_container_width=True)
+        testar_kruskal_e_posthoc(df_filtrado.dropna(subset=["ASI"]), "Setor_Padronizado", "ASI", "Kruskal-Wallis para ASI por setor")
 
     st.markdown("---")
     st.markdown("### 3. Profilaxia cirúrgica")
@@ -1188,12 +1316,24 @@ with tab6:
         tb_prof = pd.crosstab(prof["Setor_Padronizado"], prof["Profilaxia_Maior_24h"])
         st.write("Profilaxia >24h por setor")
         st.dataframe(tb_prof, use_container_width=True)
+        exibir_resultado_categorico("Profilaxia cirúrgica >24h por setor", tb_prof)
+        testar_kruskal_e_posthoc(prof, "Setor_Padronizado", "Tempo_Analise_Profilaxia", "Kruskal-Wallis para duração da profilaxia por setor")
 
     st.markdown("---")
     st.markdown("### 4. Double coverage / sobreposição terapêutica potencial")
     st.caption("Quando há datas de início/fim, o app verifica sobreposição temporal. Sem datas confiáveis, sinaliza apenas sobreposição potencial por mesma classe/espectro na internação.")
     st.dataframe(df_sobreposicao_filtrado, use_container_width=True)
     st.download_button("Baixar possíveis sobreposições", df_sobreposicao_filtrado.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"), "sobreposicao_potencial.csv", "text/csv")
+    if df_sobreposicao_filtrado is not None and not df_sobreposicao_filtrado.empty:
+        overlap_ids = set(df_sobreposicao_filtrado["ID_Internacao"].dropna().astype(str))
+        tmp_overlap = df_internacao_filtrado.copy()
+        tmp_overlap["sobreposicao_potencial"] = tmp_overlap["ID_Internacao"].astype(str).isin(overlap_ids).astype(int)
+        tb_overlap = pd.crosstab(tmp_overlap["setor_principal"], tmp_overlap["sobreposicao_potencial"])
+        st.write("Sobreposição potencial por setor")
+        st.dataframe(tb_overlap, use_container_width=True)
+        exibir_resultado_categorico("Sobreposição terapêutica potencial por setor", tb_overlap)
+    else:
+        exibir_sem_pvalor("Double coverage", "Nenhuma sobreposição potencial foi identificada no filtro atual; portanto não há teste inferencial a executar.")
 
 # ------------------------------------------------------------
 # ABA 7 - DADOS
@@ -1237,6 +1377,7 @@ with tab8:
         ["SRS muito alto (≥75)", int(df_filtrado["SRS_Prescricao"].ge(75).sum()), n_presc, formatar_pct_ic(int(df_filtrado["SRS_Prescricao"].ge(75).sum()), n_presc)],
     ], columns=["Indicador", "n", "denominador", "% e IC95%"])
     st.dataframe(indicadores, use_container_width=True)
+    exibir_sem_pvalor("Indicadores proporcionais com IC95%", "Esta seção apresenta estimativas descritivas e intervalos de confiança de Wilson; não é um teste de hipótese isolado.")
 
     st.markdown("---")
     st.markdown("### Auditoria de qualidade dos dados")
@@ -1287,7 +1428,16 @@ with tab9:
     with coly:
         yboot = st.selectbox("Y", ["CUSTO_TOTAL_R$", "DOT_Exato", "Ratio_DDD", "ASI", "SRS_Prescricao", "Idade"], index=0)
     rho, rli, rls = bootstrap_ci_spearman(df_filtrado, xboot, yboot)
-    st.info(f"rho={rho:.3f}; IC95% bootstrap {rli:.3f} a {rls:.3f}" if pd.notna(rho) else "Correlação não estimável.")
+    if pd.notna(rho):
+        base_boot_p = df_filtrado[[xboot, yboot]].dropna()
+        rho_p, p_spear_boot = stats.spearmanr(base_boot_p[xboot], base_boot_p[yboot]) if len(base_boot_p) >= 5 and base_boot_p[xboot].nunique() > 1 and base_boot_p[yboot].nunique() > 1 else (np.nan, np.nan)
+        st.info(f"rho={rho:.3f}; IC95% bootstrap {rli:.3f} a {rls:.3f}; p-valor Spearman={formatar_p(p_spear_boot)}")
+        if pd.notna(p_spear_boot) and p_spear_boot < ALFA:
+            st.success(interpretar_p(p_spear_boot))
+        else:
+            st.warning(interpretar_p(p_spear_boot))
+    else:
+        st.info("Correlação não estimável.")
 
     st.markdown("---")
     st.markdown("### 4. Mortalidade — análise exploratória")
@@ -1345,6 +1495,11 @@ with tab10:
     matriz_srs = gerar_matriz_prioridade(df_internacao_filtrado)
     st.dataframe(matriz_srs.round(2), use_container_width=True)
     st.download_button("Baixar matriz de prioridade SRS", matriz_srs.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"), "matriz_prioridade_srs.csv", "text/csv")
+    testar_kruskal_e_posthoc(df_internacao_filtrado, "setor_principal", "srs_max", "Kruskal-Wallis para SRS máximo por internação e setor")
+    tb_srs_alto = pd.crosstab(df_internacao_filtrado["setor_principal"], df_internacao_filtrado["srs_max"].ge(50).astype(int))
+    st.write("SRS alto/muito alto por setor")
+    st.dataframe(tb_srs_alto, use_container_width=True)
+    exibir_resultado_categorico("SRS alto/muito alto por setor", tb_srs_alto)
 
     st.markdown("### Top alertas para auditoria")
     cols_alerta = ["ID_Internacao", "ATB", "Setor_Padronizado", "Motivo", "Sindrome", "DOT_Exato", "CUSTO_TOTAL_R$", "Status_DDD", "AWaRe", "ASI", "SRS_Prescricao", "SRS_Classe", "SRS_Fatores"]
@@ -1374,6 +1529,7 @@ with tab10:
 with tab11:
     st.subheader("Análise de sensibilidade epidemiológica — cenários simulados")
     st.warning("Esta aba é uma simulação didática/estratégica. Não usa dados reais de resistência microbiológica da planilha atual e não deve ser descrita como resultado clínico.")
+    exibir_sem_pvalor("Sensibilidade epidemiológica simulada", "VPP e VPN são recalculados por fórmulas determinísticas a partir dos sliders; não há teste estatístico nem p-valor associado.")
     col1, col2, col3 = st.columns(3)
     with col1:
         sens = st.slider("Sensibilidade do alerta/modelo", 0.01, 0.99, 0.85, 0.01)
@@ -1397,3 +1553,33 @@ with tab11:
 A análise de sensibilidade epidemiológica foi incluída como funcionalidade exploratória do dashboard para simular o impacto da prevalência de patógenos multirresistentes sobre valores preditivos de regras de alerta. Como a base atual não contém dados microbiológicos estruturados suficientes, essa aba não foi utilizada como inferência clínica principal.""",
         language="markdown",
     )
+
+
+# ------------------------------------------------------------
+# ABA 12 - PAINEL CONSOLIDADO DE P-VALUES
+# ------------------------------------------------------------
+with tab12:
+    st.subheader("Painel consolidado de p-valores e interpretações")
+    st.caption("Esta aba reúne os testes inferenciais executados nas abas do dashboard. Gráficos puramente descritivos, indicadores com IC95% e simulações determinísticas são identificados como análises sem p-valor aplicável nas respectivas abas.")
+    painel_p = montar_painel_inferencial(df_filtrado, df_internacao_filtrado, df_sobreposicao_filtrado)
+    if painel_p.empty:
+        st.warning("Nenhum teste inferencial pôde ser calculado com os filtros atuais.")
+    else:
+        st.dataframe(painel_p.round(4), use_container_width=True, height=520)
+        n_sig = int((painel_p["Decisão"] == "Significativo").sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Testes calculados", len(painel_p))
+        c2.metric("p<0,05", n_sig)
+        c3.metric("p≥0,05 ou NA", len(painel_p) - n_sig)
+        st.download_button(
+            "Baixar painel consolidado de p-values",
+            painel_p.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            "painel_pvalues_interpretacoes.csv",
+            "text/csv",
+        )
+        st.markdown("### Leitura metodológica")
+        st.write(
+            "Os p-valores indicam evidência estatística contra a hipótese nula de ausência de diferença/associação. "
+            "Resultados com p≥0,05 não comprovam ausência de efeito; indicam que a amostra disponível não forneceu evidência suficiente ao nível de 5%. "
+            "Para tabelas com contagens pequenas, o teste exato de Fisher é priorizado quando a estrutura é 2x2. Para variáveis contínuas assimétricas, a comparação usa Kruskal-Wallis e, quando significativo, pós-teste de Mann-Whitney com correção de Holm."
+        )
