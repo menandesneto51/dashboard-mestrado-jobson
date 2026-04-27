@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Dashboard Executivo & Estatístico - Stewardship Antimicrobiano
-Mestrado Fiocruz - Versão expandida V18
+Mestrado Fiocruz - Versão expandida V19
 
 Esta versão mantém a planilha/formulário já existentes e cria novas análises
 apenas a partir dos campos já disponíveis na aba PRESCRIÇÕES.
@@ -10,7 +10,7 @@ Como usar:
 1) Coloque este arquivo .py na mesma pasta da planilha:
    Sistema de Monitoramento - Mestrado Jobson (V14.0).xlsx
 2) Execute:
-   python -m streamlit run app_mestrado_jobson_v18_expandido.py
+   python -m streamlit run app_mestrado_jobson_v19_score.py
 
 Dependências principais:
 pip install streamlit pandas numpy scipy statsmodels plotly openpyxl
@@ -44,9 +44,9 @@ px.defaults.color_continuous_scale = "Viridis"
 
 st.title("📊 Dashboard Executivo & Estatístico - Stewardship Antimicrobiano")
 st.caption(
-    "V18 expandida: mantém a planilha/formulário existentes e adiciona Tabela 1, "
+    "V19 expandida: mantém a planilha/formulário existentes e adiciona Tabela 1, "
     "auditoria de qualidade, AWaRe aproximado, ASI, profilaxia cirúrgica, sobreposição potencial, "
-    "ranking de antimicrobianos, bootstrap e simulação epidemiológica."
+    "ranking de antimicrobianos, bootstrap, simulação epidemiológica e Score de Risco de Stewardship (SRS)."
 )
 st.markdown("---")
 
@@ -326,6 +326,163 @@ def detectar_profilaxia(row):
     return int(("profil" in txt) or ("cirurg" in txt and "infecc" not in txt))
 
 
+def classificar_risco_srs(score):
+    """Classifica o Score de Risco de Stewardship (SRS) em faixas operacionais."""
+    if pd.isna(score):
+        return "Não calculado"
+    if score < 25:
+        return "1. Baixo"
+    if score < 50:
+        return "2. Moderado"
+    if score < 75:
+        return "3. Alto"
+    return "4. Muito alto"
+
+
+def calcular_srs_linha(row, dot_p75=np.nan, custo_p75=np.nan):
+    """Calcula Score de Risco de Stewardship por prescrição, sem alterar a planilha.
+
+    O SRS é um índice exploratório, transparente e auditável, de 0 a 100 pontos.
+    Ele prioriza auditorias de stewardship, mas não deve ser interpretado como
+    modelo causal ou preditor validado de mortalidade/resistência.
+    """
+    pontos = 0
+    fatores = []
+
+    status_ddd = str(row.get("Status_DDD", ""))
+    if row.get("DDD_Inadequada", 0) == 1:
+        if "Superdose" in status_ddd:
+            pontos += 20
+            fatores.append("superdose pela DDD")
+        elif "Subdose" in status_ddd:
+            pontos += 15
+            fatores.append("subdose pela DDD")
+        else:
+            pontos += 15
+            fatores.append("DDD inadequada")
+
+    if row.get("Alerta_Outlier_Dose", 0) == 1:
+        pontos += 10
+        fatores.append("outlier de dose")
+
+    dot = pd.to_numeric(row.get("DOT_Exato", np.nan), errors="coerce")
+    if pd.notna(dot) and pd.notna(dot_p75) and dot > dot_p75:
+        pontos += 15
+        fatores.append("DOT acima do P75")
+
+    custo = pd.to_numeric(row.get("CUSTO_TOTAL_R$", np.nan), errors="coerce")
+    if pd.notna(custo) and pd.notna(custo_p75) and custo > custo_p75:
+        pontos += 10
+        fatores.append("custo acima do P75")
+
+    aware = str(row.get("AWaRe", ""))
+    if aware == "Reserve":
+        pontos += 20
+        fatores.append("antimicrobiano Reserve")
+    elif aware == "Watch":
+        pontos += 10
+        fatores.append("antimicrobiano Watch")
+
+    if row.get("Amplo_Espectro", 0) == 1:
+        pontos += 10
+        fatores.append("amplo espectro")
+
+    if row.get("Erro_Administracao", 0) == 1:
+        pontos += 20
+        fatores.append("administração incompleta/suspensa")
+
+    if row.get("Profilaxia_Maior_24h", 0) == 1:
+        pontos += 20
+        fatores.append("profilaxia cirúrgica >24h")
+
+    if row.get("Cultura_Sim", 0) == 0:
+        pontos += 5
+        fatores.append("sem cultura registrada")
+
+    if row.get("Tempo_Determinado", 0) == 0:
+        pontos += 5
+        fatores.append("tempo não determinado")
+
+    pontos = int(min(max(pontos, 0), 100))
+    return pd.Series({
+        "SRS_Prescricao": pontos,
+        "SRS_Classe": classificar_risco_srs(pontos),
+        "SRS_Fatores": "; ".join(fatores) if fatores else "sem alerta relevante",
+    })
+
+
+def gerar_matriz_prioridade(df_int):
+    """Resume risco por setor para priorização operacional."""
+    if df_int.empty or "srs_max" not in df_int.columns:
+        return pd.DataFrame()
+    base = df_int.copy()
+    base["alto_ou_muito_alto"] = base["srs_max"].ge(50).astype(int)
+    out = base.groupby("setor_principal", dropna=False).agg(
+        internacoes=("ID_Internacao", "nunique"),
+        srs_mediano=("srs_max", "median"),
+        srs_medio=("srs_max", "mean"),
+        alto_muito_alto_n=("alto_ou_muito_alto", "sum"),
+        custo_total=("custo_total", "sum"),
+        custo_inconformidade=("custo_inconformidade", "sum"),
+        dot_total=("dot_total", "sum"),
+        obitos=("obito", "sum"),
+    ).reset_index()
+    out["alto_muito_alto_%"] = np.where(out["internacoes"] > 0, 100 * out["alto_muito_alto_n"] / out["internacoes"], np.nan)
+    out["prioridade"] = pd.cut(
+        out["srs_mediano"],
+        bins=[-0.1, 24.999, 49.999, 74.999, 100],
+        labels=["Baixa", "Moderada", "Alta", "Muito alta"],
+    )
+    return out.sort_values(["srs_mediano", "custo_inconformidade", "dot_total"], ascending=False)
+
+
+def gerar_relatorio_srs_markdown(df_presc, df_int, matriz, top_alertas):
+    """Gera relatório textual simples para exportação e discussão."""
+    n_presc = len(df_presc)
+    n_int = df_int["ID_Internacao"].nunique() if not df_int.empty else 0
+    alto_presc = int(df_presc["SRS_Prescricao"].ge(50).sum()) if "SRS_Prescricao" in df_presc.columns else 0
+    muito_alto_presc = int(df_presc["SRS_Prescricao"].ge(75).sum()) if "SRS_Prescricao" in df_presc.columns else 0
+    alto_int = int(df_int["srs_max"].ge(50).sum()) if "srs_max" in df_int.columns else 0
+    custo_total = float(pd.to_numeric(df_presc.get("CUSTO_TOTAL_R$", pd.Series(dtype=float)), errors="coerce").sum())
+    custo_inconf = float(pd.to_numeric(df_presc.get("Custo_Inconformidade", pd.Series(dtype=float)), errors="coerce").sum())
+    setor_top = matriz.iloc[0]["setor_principal"] if not matriz.empty else "não estimável"
+    srs_top = matriz.iloc[0]["srs_mediano"] if not matriz.empty else np.nan
+
+    linhas_alertas = []
+    for _, r in top_alertas.head(10).iterrows():
+        linhas_alertas.append(
+            f"- Internação {r.get('ID_Internacao', '')}: SRS {r.get('SRS_Prescricao', '')}; "
+            f"ATB {r.get('ATB', '')}; fatores: {r.get('SRS_Fatores', '')}."
+        )
+    alertas_txt = "\n".join(linhas_alertas) if linhas_alertas else "- Sem alertas no filtro atual."
+
+    return f"""# Relatório automático - Score de Risco de Stewardship (SRS)
+
+## Síntese da amostra filtrada
+
+- Prescrições analisadas: **{n_presc}**.
+- Internações analisadas: **{n_int}**.
+- Prescrições com SRS alto ou muito alto (≥50): **{alto_presc}** ({formatar_pct_ic(alto_presc, n_presc)}).
+- Prescrições com SRS muito alto (≥75): **{muito_alto_presc}** ({formatar_pct_ic(muito_alto_presc, n_presc)}).
+- Internações com SRS máximo alto ou muito alto: **{alto_int}** ({formatar_pct_ic(alto_int, n_int)}).
+- Custo total observado: **R$ {custo_total:,.2f}**.
+- Custo associado a inconformidades: **R$ {custo_inconf:,.2f}**.
+- Setor com maior prioridade pelo SRS mediano: **{setor_top}** (SRS mediano: {srs_top:.1f}).
+
+## Critérios do SRS
+
+O SRS é um índice exploratório, de 0 a 100 pontos, construído a partir de variáveis já existentes na planilha: inadequação à DDD, outlier de dose, DOT acima do percentil 75, custo acima do percentil 75, classificação AWaRe Watch/Reserve, amplo espectro, administração incompleta/suspensa, profilaxia cirúrgica >24h, ausência de cultura registrada e ausência de tempo determinado.
+
+## Interpretação
+
+O SRS deve ser usado para **priorização de auditoria clínica/farmacêutica e gestão de stewardship**. Ele não deve ser descrito como modelo causal, nem como preditor validado de mortalidade ou resistência antimicrobiana. Em bases futuras com cultura, patógeno e antibiograma estruturados, poderá servir como componente inicial para modelos preditivos formais.
+
+## Top alertas individuais
+
+{alertas_txt}
+"""
+
+
 def otimizar_memoria(df):
     df = df.copy()
     for col in df.select_dtypes(include=["object"]).columns:
@@ -456,6 +613,13 @@ def preparar_variaveis(df):
         pd.to_numeric(df["CUSTO_TOTAL_R$"], errors="coerce").fillna(0),
         0,
     )
+
+    # V19: Score de Risco de Stewardship (SRS), calculado sem alterar formulário/planilha.
+    dot_p75 = pd.to_numeric(df["DOT_Exato"], errors="coerce").quantile(0.75)
+    custo_p75 = pd.to_numeric(df["CUSTO_TOTAL_R$"], errors="coerce").quantile(0.75)
+    srs_cols = df.apply(lambda row: calcular_srs_linha(row, dot_p75=dot_p75, custo_p75=custo_p75), axis=1)
+    df = pd.concat([df, srs_cols], axis=1)
+
     return otimizar_memoria(df)
 
 
@@ -523,10 +687,14 @@ def agregar_internacoes(df):
         prof_cirurgica_alguma=("Profilaxia_Cirurgica", "max"),
         prof_maior_24h_alguma=("Profilaxia_Maior_24h", "max"),
         outlier_dose_algum=("Alerta_Outlier_Dose", "max"),
+        srs_max=("SRS_Prescricao", "max"),
+        srs_medio=("SRS_Prescricao", "mean"),
+        srs_classe_internacao=("SRS_Classe", moda_segura),
         desfecho_final=("Desfecho", desfecho_final),
         desfechos_registrados=("Desfecho", lambda x: " | ".join(pd.unique(x.dropna().astype(str)))),
     ).reset_index()
     agg["multiplos_desfechos"] = agg["desfechos_registrados"].astype(str).str.contains(r"\|").astype(int)
+    agg["srs_classe_max"] = agg["srs_max"].apply(classificar_risco_srs)
     return otimizar_memoria(agg)
 
 # ============================================================
@@ -800,7 +968,7 @@ st.caption(
 # 7. ABAS DO DASHBOARD
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "👁️ 1. Visão Geral",
     "📈 2. Padrões Clínicos",
     "🏥 3. Desfechos e Risco",
@@ -810,20 +978,22 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "🗄️ 7. Dados",
     "📋 8. Qualidade & Artigo",
     "🔮 9. Modelagem & Bootstrap",
-    "🧪 10. Sensibilidade",
+    "🧭 10. SRS & Relatório",
+    "🧪 11. Sensibilidade",
 ])
 
 # ------------------------------------------------------------
 # ABA 1
 # ------------------------------------------------------------
 with tab1:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Internações", f"{df_internacao_filtrado['ID_Internacao'].nunique()}")
     c2.metric("Prescrições", f"{len(df_filtrado)}")
     c3.metric("Antimicrobianos", f"{df_filtrado['ATB'].nunique()}")
     c4.metric("Custo total", f"R$ {df_filtrado['CUSTO_TOTAL_R$'].sum():,.2f}")
     c5.metric("DOT mediano", f"{df_filtrado['DOT_Exato'].median():.2f}")
     c6.metric("ASI médio", f"{df_filtrado['ASI'].mean():.2f}" if df_filtrado['ASI'].notna().any() else "NA")
+    c7.metric("SRS médio", f"{df_filtrado['SRS_Prescricao'].mean():.1f}" if 'SRS_Prescricao' in df_filtrado.columns else "NA")
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -1063,6 +1233,8 @@ with tab8:
         ["AUD_PRESCRICAO não informado", int(df_filtrado["Prescricao_Nao_Informada"].sum()), n_presc, formatar_pct_ic(int(df_filtrado["Prescricao_Nao_Informada"].sum()), n_presc)],
         ["Óbito por internação", n_obitos, n_int, formatar_pct_ic(n_obitos, n_int)],
         ["Outlier de dose", int(df_filtrado["Alerta_Outlier_Dose"].sum()), n_presc, formatar_pct_ic(int(df_filtrado["Alerta_Outlier_Dose"].sum()), n_presc)],
+        ["SRS alto ou muito alto (≥50)", int(df_filtrado["SRS_Prescricao"].ge(50).sum()), n_presc, formatar_pct_ic(int(df_filtrado["SRS_Prescricao"].ge(50).sum()), n_presc)],
+        ["SRS muito alto (≥75)", int(df_filtrado["SRS_Prescricao"].ge(75).sum()), n_presc, formatar_pct_ic(int(df_filtrado["SRS_Prescricao"].ge(75).sum()), n_presc)],
     ], columns=["Indicador", "n", "denominador", "% e IC95%"])
     st.dataframe(indicadores, use_container_width=True)
 
@@ -1074,7 +1246,7 @@ with tab8:
     st.markdown("---")
     st.markdown("### Tabela 1 automática")
     outcome = st.selectbox("Estratificar Tabela 1 por", ["erro_admin_algum", "obito", "amplo_espectro", "prof_maior_24h_alguma"], index=0)
-    vars_t1 = ["idade", "sexo", "setor_principal", "n_prescricoes", "n_atb", "dot_total", "ddd_total", "custo_total", "asi_total", "amplo_espectro", "aware_watch_reserve", "tempo_determinado_algum", "cultura_alguma", "outlier_dose_algum"]
+    vars_t1 = ["idade", "sexo", "setor_principal", "n_prescricoes", "n_atb", "dot_total", "ddd_total", "custo_total", "asi_total", "srs_max", "srs_medio", "amplo_espectro", "aware_watch_reserve", "tempo_determinado_algum", "cultura_alguma", "outlier_dose_algum"]
     tabela1 = gerar_tabela1(df_internacao_filtrado, outcome, vars_t1)
     if tabela1.empty:
         st.warning("Não foi possível gerar Tabela 1 para o desfecho selecionado.")
@@ -1097,13 +1269,13 @@ A adequação à DDD foi observada em {formatar_pct_ic(n_ddd_ok, n_presc)} das p
 with tab9:
     st.subheader("Modelagem, correlação, bootstrap e limites inferenciais")
     st.markdown("### 1. Correlação de Spearman")
-    vars_corr_presc = ["Idade", "DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI"]
+    vars_corr_presc = ["Idade", "DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI", "SRS_Prescricao"]
     interp_corr = correlacoes_spearman(df_filtrado, vars_corr_presc)
     st.dataframe(interp_corr.round(4), use_container_width=True)
 
     st.markdown("---")
     st.markdown("### 2. Bootstrap para medianas")
-    variavel_boot = st.selectbox("Variável para IC95% bootstrap da mediana", ["DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI"])
+    variavel_boot = st.selectbox("Variável para IC95% bootstrap da mediana", ["DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI", "SRS_Prescricao"])
     med, li, ls = bootstrap_ci_median(df_filtrado[variavel_boot])
     st.metric("Mediana observada", f"{med:.3f}" if pd.notna(med) else "NA")
     st.info(f"IC95% bootstrap da mediana: {li:.3f} a {ls:.3f}" if pd.notna(li) else "Bootstrap não estimável.")
@@ -1111,9 +1283,9 @@ with tab9:
     st.markdown("### 3. Bootstrap para Spearman")
     colx, coly = st.columns(2)
     with colx:
-        xboot = st.selectbox("X", ["DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI", "Idade"], index=0)
+        xboot = st.selectbox("X", ["DOT_Exato", "CUSTO_TOTAL_R$", "Ratio_DDD", "ASI", "SRS_Prescricao", "Idade"], index=0)
     with coly:
-        yboot = st.selectbox("Y", ["CUSTO_TOTAL_R$", "DOT_Exato", "Ratio_DDD", "ASI", "Idade"], index=0)
+        yboot = st.selectbox("Y", ["CUSTO_TOTAL_R$", "DOT_Exato", "Ratio_DDD", "ASI", "SRS_Prescricao", "Idade"], index=0)
     rho, rli, rls = bootstrap_ci_spearman(df_filtrado, xboot, yboot)
     st.info(f"rho={rho:.3f}; IC95% bootstrap {rli:.3f} a {rls:.3f}" if pd.notna(rho) else "Correlação não estimável.")
 
@@ -1125,7 +1297,7 @@ with tab9:
     if eventos < 10:
         st.warning("Regressão logística múltipla não é recomendada com menos de 10 eventos. A análise abaixo é exploratória.")
         comparacoes = []
-        for var in ["idade", "dot_total", "custo_total", "n_prescricoes", "n_atb", "asi_total", "custo_inconformidade"]:
+        for var in ["idade", "dot_total", "custo_total", "n_prescricoes", "n_atb", "asi_total", "srs_max", "custo_inconformidade"]:
             g0 = pd.to_numeric(df_internacao_filtrado.loc[df_internacao_filtrado["obito"] == 0, var], errors="coerce").dropna()
             g1 = pd.to_numeric(df_internacao_filtrado.loc[df_internacao_filtrado["obito"] == 1, var], errors="coerce").dropna()
             if len(g0) > 0 and len(g1) > 0:
@@ -1147,9 +1319,59 @@ with tab9:
     st.caption("Firth/Pydantic não foram ativados nesta versão para evitar novas dependências e manter publicação simples no Streamlit. A análise de eventos raros permanece protegida por trava metodológica.")
 
 # ------------------------------------------------------------
-# ABA 10 - SENSIBILIDADE
+# ABA 10 - SCORE DE RISCO DE STEWARDSHIP
 # ------------------------------------------------------------
 with tab10:
+    st.subheader("Score de Risco de Stewardship (SRS) e relatório automático")
+    st.info("O SRS é um índice exploratório de priorização de auditoria, calculado apenas com campos já existentes na planilha. Não é modelo causal nem preditor validado de resistência ou mortalidade.")
+
+    col1, col2, col3, col4 = st.columns(4)
+    n_alto = int(df_filtrado["SRS_Prescricao"].ge(50).sum()) if not df_filtrado.empty else 0
+    n_muito_alto = int(df_filtrado["SRS_Prescricao"].ge(75).sum()) if not df_filtrado.empty else 0
+    n_int_alto = int(df_internacao_filtrado["srs_max"].ge(50).sum()) if not df_internacao_filtrado.empty else 0
+    col1.metric("SRS médio por prescrição", f"{df_filtrado['SRS_Prescricao'].mean():.1f}" if not df_filtrado.empty else "NA")
+    col2.metric("Prescrições SRS ≥50", formatar_pct_ic(n_alto, len(df_filtrado)))
+    col3.metric("Prescrições SRS ≥75", formatar_pct_ic(n_muito_alto, len(df_filtrado)))
+    col4.metric("Internações SRS máx ≥50", formatar_pct_ic(n_int_alto, len(df_internacao_filtrado)))
+
+    st.markdown("---")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.plotly_chart(px.histogram(df_filtrado, x="SRS_Prescricao", color="SRS_Classe", nbins=20, title="Distribuição do SRS por prescrição"), use_container_width=True)
+    with col_b:
+        st.plotly_chart(px.box(df_internacao_filtrado, x="setor_principal", y="srs_max", points="all", title="SRS máximo por internação e setor"), use_container_width=True)
+
+    st.markdown("### Matriz de prioridade por setor")
+    matriz_srs = gerar_matriz_prioridade(df_internacao_filtrado)
+    st.dataframe(matriz_srs.round(2), use_container_width=True)
+    st.download_button("Baixar matriz de prioridade SRS", matriz_srs.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"), "matriz_prioridade_srs.csv", "text/csv")
+
+    st.markdown("### Top alertas para auditoria")
+    cols_alerta = ["ID_Internacao", "ATB", "Setor_Padronizado", "Motivo", "Sindrome", "DOT_Exato", "CUSTO_TOTAL_R$", "Status_DDD", "AWaRe", "ASI", "SRS_Prescricao", "SRS_Classe", "SRS_Fatores"]
+    cols_alerta = [c for c in cols_alerta if c in df_filtrado.columns]
+    top_alertas = df_filtrado.sort_values(["SRS_Prescricao", "CUSTO_TOTAL_R$", "DOT_Exato"], ascending=False)[cols_alerta].head(30)
+    st.dataframe(top_alertas, use_container_width=True)
+    st.download_button("Baixar top alertas SRS", top_alertas.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"), "top_alertas_srs.csv", "text/csv")
+
+    st.markdown("### Relatório automático em Markdown")
+    relatorio_srs = gerar_relatorio_srs_markdown(df_filtrado, df_internacao_filtrado, matriz_srs, top_alertas)
+    st.download_button("Baixar relatório SRS (.md)", relatorio_srs.encode("utf-8"), "relatorio_srs_stewardship.md", "text/markdown")
+    with st.expander("Visualizar relatório"):
+        st.markdown(relatorio_srs)
+
+    st.markdown("### Pesos do SRS")
+    pesos = pd.DataFrame([
+        ["Subdose pela DDD", 15], ["Superdose pela DDD", 20], ["Outlier de dose", 10],
+        ["DOT acima do P75", 15], ["Custo acima do P75", 10], ["AWaRe Watch", 10],
+        ["AWaRe Reserve", 20], ["Amplo espectro", 10], ["Administração incompleta/suspensa", 20],
+        ["Profilaxia cirúrgica >24h", 20], ["Sem cultura registrada", 5], ["Tempo não determinado", 5],
+    ], columns=["Critério", "Pontos"])
+    st.dataframe(pesos, use_container_width=True)
+
+# ------------------------------------------------------------
+# ABA 11 - SENSIBILIDADE
+# ------------------------------------------------------------
+with tab11:
     st.subheader("Análise de sensibilidade epidemiológica — cenários simulados")
     st.warning("Esta aba é uma simulação didática/estratégica. Não usa dados reais de resistência microbiológica da planilha atual e não deve ser descrita como resultado clínico.")
     col1, col2, col3 = st.columns(3)
